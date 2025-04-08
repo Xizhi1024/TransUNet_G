@@ -21,6 +21,15 @@ def get_b16_config():
     config.decoder_channels = (256, 128, 64, 16)
     config.n_classes = 2
     config.activation = 'softmax'
+    config.decoder = ml_collections.ConfigDict()
+    config.decoder.upsample_type = 'dysample'
+    config.decoder.dysample_style = 'lp'
+    config.decoder.dysample_groups = 4 # Check if 768, 256, 128, 64 are divisible by 4
+    config.decoder.dysample_scope = False
+
+    # --- Explicitly state no skips ---
+    # config.skip_channels = [] # Or leave undefined
+    config.n_skip = 0
     return config
 
 
@@ -54,7 +63,11 @@ def get_r50_b16_config():
     config.n_classes = 2
     config.n_skip = 3
     config.activation = 'softmax'
-
+    config.decoder = ml_collections.ConfigDict()
+    config.decoder.upsample_type = 'dysample'  # Options: 'dysample', 'bilinear'
+    config.decoder.dysample_style = 'lp'       # Options: 'lp', 'pl'
+    config.decoder.dysample_groups = 4         # Adjust as needed, must divide in_channels of block
+    config.decoder.dysample_scope = False      # Set to True to enable dynamic scope
     return config
 
 

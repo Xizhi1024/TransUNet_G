@@ -12,13 +12,14 @@ from os.path import join as pjoin
 import torch
 import torch.nn as nn
 import numpy as np
-
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
 from . import vit_seg_configs as configs
 from .vit_seg_modeling_resnet_skip import ResNetV2
-
+from .somethingnew import FrequencySupplementBlock
+from .somethingnew import SpatialAttentionFusion
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,86 @@ class Conv2dReLU(nn.Sequential):
 
         super(Conv2dReLU, self).__init__(conv, bn, relu)
 
+def normal_init(module, mean=0, std=1, bias=0):
+    if hasattr(module, 'weight') and module.weight is not None:
+        nn.init.normal_(module.weight, mean, std)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
+
+
+def constant_init(module, val, bias=0):
+    if hasattr(module, 'weight') and module.weight is not None:
+        nn.init.constant_(module.weight, val)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
+
+class DySample(nn.Module):
+    """
+    Implementation of DySample based on the provided code.
+    """
+    def __init__(self, in_channels, scale=2, style='lp', groups=4, dyscope=False):
+        super().__init__()
+        self.scale = scale
+        self.style = style
+        self.groups = groups
+        assert style in ['lp', 'pl']
+        if style == 'pl':
+            assert in_channels >= scale ** 2 and in_channels % scale ** 2 == 0
+        assert in_channels >= groups and in_channels % groups == 0
+
+        if style == 'pl':
+            in_channels = in_channels // scale ** 2
+            out_channels = 2 * groups
+        else:
+            out_channels = 2 * groups * scale ** 2
+
+        self.offset = nn.Conv2d(in_channels, out_channels, 1)
+        normal_init(self.offset, std=0.001)
+        if dyscope:
+            self.scope = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+            constant_init(self.scope, val=0.)
+
+        self.register_buffer('init_pos', self._init_pos())
+
+    def _init_pos(self):
+        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
+        return torch.stack(torch.meshgrid([h, h])).transpose(1, 2).repeat(1, self.groups, 1).reshape(1, -1, 1, 1)
+
+    def sample(self, x, offset):
+        B, _, H, W = offset.shape
+        offset = offset.view(B, 2, -1, H, W)
+        coords_h = torch.arange(H) + 0.5
+        coords_w = torch.arange(W) + 0.5
+        coords = torch.stack(torch.meshgrid([coords_w, coords_h])
+                             ).transpose(1, 2).unsqueeze(1).unsqueeze(0).type(x.dtype).to(x.device)
+        normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device).view(1, 2, 1, 1, 1)
+        coords = 2 * (coords + offset) / normalizer - 1
+        coords = F.pixel_shuffle(coords.view(B, -1, H, W), self.scale).view(
+            B, 2, -1, self.scale * H, self.scale * W).permute(0, 2, 3, 4, 1).contiguous().flatten(0, 1)
+        return F.grid_sample(x.reshape(B * self.groups, -1, H, W), coords, mode='bilinear',
+                             align_corners=False, padding_mode="border").view(B, -1, self.scale * H, self.scale * W)
+
+    def forward_lp(self, x):
+        if hasattr(self, 'scope'):
+            offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
+        else:
+            offset = self.offset(x) * 0.25 + self.init_pos
+        return self.sample(x, offset)
+
+    def forward_pl(self, x):
+        x_ = F.pixel_shuffle(x, self.scale)
+        if hasattr(self, 'scope'):
+            offset = F.pixel_unshuffle(self.offset(x_) * self.scope(x_).sigmoid(), self.scale) * 0.5 + self.init_pos
+        else:
+            offset = F.pixel_unshuffle(self.offset(x_), self.scale) * 0.25 + self.init_pos
+        return self.sample(x, offset)
+
+    def forward(self, x):
+        if self.style == 'pl':
+            return self.forward_pl(x)
+        return self.forward_lp(x)
+    
+
 
 class DecoderBlock(nn.Module):
     def __init__(
@@ -288,10 +369,15 @@ class DecoderBlock(nn.Module):
             out_channels,
             skip_channels=0,
             use_batchnorm=True,
+            # Add parameters for DySample configuration
+            upsample_type='dysample', # 'dysample' or 'bilinear'
+            dysample_style='lp',      # 'lp' or 'pl'
+            dysample_groups=4,        # Number of groups for DySample
+            dysample_scope=False      # Use dynamic scope?
     ):
         super().__init__()
         self.conv1 = Conv2dReLU(
-            in_channels + skip_channels,
+            in_channels + skip_channels, # Input channels for conv1 remain unchanged
             out_channels,
             kernel_size=3,
             padding=1,
@@ -304,12 +390,62 @@ class DecoderBlock(nn.Module):
             padding=1,
             use_batchnorm=use_batchnorm,
         )
-        self.up = nn.UpsamplingBilinear2d(scale_factor=2)
+
+        # --- Replace the upsampling layer ---
+        if upsample_type == 'dysample':
+            # --- Add input validation for DySample ---
+            scale = 2 # Assuming scale factor is always 2 here
+            temp_style = dysample_style
+            temp_groups = dysample_groups
+
+            # Check 'pl' style constraints
+            if temp_style == 'pl':
+                required_in_channels_pl = scale ** 2
+                if not (in_channels >= required_in_channels_pl and in_channels % required_in_channels_pl == 0):
+                    logger.warning(f"DySample style 'pl' requires in_channels ({in_channels}) >= {required_in_channels_pl} and divisible by {required_in_channels_pl}. Falling back to 'lp' style for this block.")
+                    temp_style = 'lp'
+
+            # Check group constraints
+            # Find the largest valid group number <= requested groups that divides in_channels
+            possible_groups = [g for g in range(1, temp_groups + 1) if in_channels % g == 0]
+            if not possible_groups: # Should always have at least 1
+                 final_groups = 1
+            else:
+                 final_groups = max(possible_groups)
+
+            if final_groups != temp_groups:
+                 logger.warning(f"Requested DySample groups ({temp_groups}) is invalid for in_channels ({in_channels}). Adjusting groups to {final_groups} for this block.")
+
+            # Initialize DySample
+            try:
+                self.up = DySample(in_channels,
+                                   scale=scale,
+                                   style=temp_style,
+                                   groups=final_groups,
+                                   dyscope=dysample_scope)
+                logger.info(f"Using DySample(in={in_channels}, scale={scale}, style='{temp_style}', groups={final_groups}, scope={dysample_scope})")
+            except Exception as e:
+                logger.error(f"Failed to initialize DySample with in_channels={in_channels}, groups={final_groups}, style='{temp_style}'. Falling back to Bilinear. Error: {e}")
+                self.up = nn.UpsamplingBilinear2d(scale_factor=scale)
+
+        elif upsample_type == 'bilinear':
+            self.up = nn.UpsamplingBilinear2d(scale_factor=2)
+            logger.info(f"Using Bilinear Upsampling for in_channels={in_channels}")
+        else:
+            raise ValueError(f"Unknown upsample_type: {upsample_type}")
 
     def forward(self, x, skip=None):
-        x = self.up(x)
+        x = self.up(x) # Calls either DySample or Bilinear
         if skip is not None:
-            x = torch.cat([x, skip], dim=1)
+            # Ensure skip features are on the same device as x
+            if x.device != skip.device:
+                 skip = skip.to(x.device)
+            try:
+                x = torch.cat([x, skip], dim=1)
+            except RuntimeError as e:
+                logger.error(f"Error concatenating features in DecoderBlock: x shape {x.shape}, skip shape {skip.shape}. Error: {e}")
+                # Handle error, maybe skip concatenation or raise
+                raise e # Re-raise error for debugging
         x = self.conv1(x)
         x = self.conv2(x)
         return x
@@ -327,43 +463,89 @@ class DecoderCup(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        head_channels = 512
+        head_channels = 512 # Often the output channels from the ViT encoder block
         self.conv_more = Conv2dReLU(
-            config.hidden_size,
-            head_channels,
+            config.hidden_size, # Input from Transformer encoder
+            head_channels,      # Output channels to the first decoder block
             kernel_size=3,
             padding=1,
             use_batchnorm=True,
         )
-        decoder_channels = config.decoder_channels
-        in_channels = [head_channels] + list(decoder_channels[:-1])
-        out_channels = decoder_channels
+        decoder_channels = config.decoder_channels # e.g., (256, 128, 64, 16)
+        in_channels = [head_channels] + list(decoder_channels[:-1]) # e.g., [512, 256, 128, 64]
+        out_channels = decoder_channels                            # e.g., [256, 128, 64, 16]
 
-        if self.config.n_skip != 0:
-            skip_channels = self.config.skip_channels
-            for i in range(4-self.config.n_skip):  # re-select the skip channels according to n_skip
-                skip_channels[3-i]=0
+        # Skip connection channels (if using ResNet backbone)
+        if config.get('skip_channels'): # Check if skip_channels exists in config
+            skip_channels = config.skip_channels # e.g., [512, 256, 64, 16]
+            n_skip = config.get('n_skip', len(skip_channels)) # Default to using all skips if n_skip not defined
 
-        else:
-            skip_channels=[0,0,0,0]
-
-        blocks = [
-            DecoderBlock(in_ch, out_ch, sk_ch) for in_ch, out_ch, sk_ch in zip(in_channels, out_channels, skip_channels)
-        ]
-        self.blocks = nn.ModuleList(blocks)
-
-    def forward(self, hidden_states, features=None):
-        B, n_patch, hidden = hidden_states.size()  # reshape from (B, n_patch, hidden) to (B, h, w, hidden)
-        h, w = int(np.sqrt(n_patch)), int(np.sqrt(n_patch))
-        x = hidden_states.permute(0, 2, 1)
-        x = x.contiguous().view(B, hidden, h, w)
-        x = self.conv_more(x)
-        for i, decoder_block in enumerate(self.blocks):
-            if features is not None:
-                skip = features[i] if (i < self.config.n_skip) else None
+            # Adjust skip channels based on n_skip
+            if n_skip != len(skip_channels):
+                 # Create a full list of 0s first
+                 adjusted_skips = [0] * len(skip_channels)
+                 # Fill the first n_skip channels
+                 for i in range(n_skip):
+                     if i < len(skip_channels):
+                          adjusted_skips[i] = skip_channels[i]
+                 final_skip_channels = adjusted_skips
             else:
-                skip = None
+                 final_skip_channels = skip_channels
+
+            # Ensure skip channel list matches the number of decoder blocks
+            num_decoder_blocks = len(in_channels)
+            if len(final_skip_channels) < num_decoder_blocks:
+                 # Pad with 0s if fewer skip channels than blocks
+                 final_skip_channels.extend([0] * (num_decoder_blocks - len(final_skip_channels)))
+            elif len(final_skip_channels) > num_decoder_blocks:
+                # Truncate if more skip channels than blocks (shouldn't usually happen)
+                final_skip_channels = final_skip_channels[:num_decoder_blocks]
+
+        else: # No skip connections defined (e.g., pure ViT)
+            final_skip_channels = [0] * len(in_channels)
+            n_skip = 0 # Explicitly set n_skip to 0
+
+        # --- Get DySample parameters from config ---
+        # Use .get() with defaults for robustness
+        decoder_config = config.get('decoder', {}) # Get decoder sub-config or empty dict
+        upsample_type = decoder_config.get('upsample_type', 'dysample') # Default to dysample
+        dysample_style = decoder_config.get('dysample_style', 'lp')
+        dysample_groups = decoder_config.get('dysample_groups', 4)
+        dysample_scope = decoder_config.get('dysample_scope', False)
+
+        # Build decoder blocks iteratively
+        blocks = []
+        for i, (in_ch, out_ch) in enumerate(zip(in_channels, out_channels)):
+            sk_ch = final_skip_channels[i] if i < len(final_skip_channels) else 0
+            blocks.append(
+                DecoderBlock(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    skip_channels=sk_ch,
+                    use_batchnorm=True, # Assuming standard BatchNorm use
+                    # Pass DySample config
+                    upsample_type=upsample_type,
+                    dysample_style=dysample_style,
+                    dysample_groups=dysample_groups,
+                    dysample_scope=dysample_scope
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+        self.n_skip = n_skip # Store n_skip for use in forward pass
+
+    def forward(self, fused_features_map, features=None): # Accepts fused map
+    # Apply conv_more as the first step
+        x = self.conv_more(fused_features_map)
+
+        # ... (rest of the loop applying blocks and skips) ...
+        for i, decoder_block in enumerate(self.blocks):
+            skip = None
+            if features is not None and i < self.n_skip:
+                if i < len(features):
+                    skip = features[i]
+                # ... (warning log) ...
             x = decoder_block(x, skip=skip)
+
         return x
 
 
@@ -381,18 +563,45 @@ class VisionTransformer(nn.Module):
             kernel_size=3,
         )
         self.config = config
+        vit_patch_size = config.patches['size'][0] # Assuming square patches
+        target_grid_size = img_size // vit_patch_size
+
+        # Adjust input channels based on your dataset (e.g., 1 for BraTS, 3 for GLAS)
+        input_channels = 3 # Change if needed
+        self.fsb = FrequencySupplementBlock(
+            in_channels=input_channels, # Make sure this matches your input data
+            embed_dim=config.hidden_size, # Match ViT hidden dim for easier fusion
+            patch_size=vit_patch_size,
+            target_grid_size=target_grid_size,
+            light_weight=True # Set to True/False based on desired model size
+        )
+        self.aam = SpatialAttentionFusion(
+            embed_dim=config.hidden_size # Input features have hidden_size channels
+        )
+
 
     def forward(self, x):
+        input_image = x.clone()
         if x.size()[1] == 1:
             x = x.repeat(1,3,1,1)
-        x, attn_weights, features = self.transformer(x)  # (B, n_patch, hidden)
-        x = self.decoder(x, features)
-        logits = self.segmentation_head(x)
+        spatial_features_seq, attn_weights, skip_features = self.transformer(x)  # (B, n_patch, hidden)
+        freq_features_map = self.fsb(input_image)
+        B, n_patch, hidden = spatial_features_seq.size()
+        h_patch, w_patch = int(np.sqrt(n_patch)), int(np.sqrt(n_patch))
+        assert h_patch == freq_features_map.size(2) and w_patch == freq_features_map.size(3), \
+            f"ViT output grid {h_patch}x{w_patch} doesn't match FSB grid {freq_features_map.size(2)}x{freq_features_map.size(3)}"
+        spatial_features_map = spatial_features_seq.permute(0, 2, 1) # (B, hidden_size, n_patch)
+        spatial_features_map = spatial_features_map.contiguous().view(B, hidden, h_patch, w_patch)
+        fused_features = self.aam(spatial_features_map, freq_features_map)
+        #decoder_input = self.decoder.conv_more(fused_features)
+        #decoder_output = self.decoder(decoder_input, skip_features, apply_conv_more=False)
+        decoder_output = self.decoder(fused_features, skip_features)
+        logits = self.segmentation_head(decoder_output)
+
         return logits
 
     def load_from(self, weights):
         with torch.no_grad():
-
             res_weight = weights
             self.transformer.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
             self.transformer.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
@@ -438,7 +647,6 @@ class VisionTransformer(nn.Module):
                 for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
                     for uname, unit in block.named_children():
                         unit.load_from(res_weight, n_block=bname, n_unit=uname)
-
 CONFIGS = {
     'ViT-B_16': configs.get_b16_config(),
     'ViT-B_32': configs.get_b32_config(),
